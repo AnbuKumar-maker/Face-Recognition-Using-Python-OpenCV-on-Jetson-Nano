@@ -1,0 +1,180 @@
+The code starts off by importing the libraries we are going to be using. The most important ones are OpenCV (called cv2 in Python), which we’ll use to read images from the camera, and face_recognition, which we’ll use to detect and compare faces.
+import face_recognition
+import cv2
+from datetime import datetime, timedelta
+import numpy as np
+import platform
+import pickle
+Next, we are going to create some variables to store data about the people who walk in front of our camera. These variables will act as a simple database of known visitors.
+known_face_encodings = []
+known_face_metadata = []
+This application is just a demo, so we are storing our known faces in a normal Python list. In a real-world application that deals with more faces, you might want to use a real database instead, but I wanted to keep this demo simple.
+Next, we have a function to save and load the known face data. Here’s the save function:
+def save_known_faces():
+    with open("known_faces.dat", "wb") as face_data_file:
+        face_data = [known_face_encodings, known_face_metadata]
+        pickle.dump(face_data, face_data_file)
+        print("Known faces backed up to disk.")
+This writes the known faces to disk using Python’s built-in pickle functionality. The data is loaded back the same way, but I didn’t show that here.
+I wanted this program to run on a desktop computer or on a Jetson Nano without any changes, so I added a simple function to detect which platform it is currently running on:
+def running_on_jetson_nano():
+    return platform.machine() == "aarch64"
+This is needed because the way we access the camera is different on each platform. On a laptop, we can just pass in a camera number to OpenCV and it will pull images from the camera. But on the Jetson Nano, we have to use gstreamer to stream images from the camera which requires some custom code.
+By being able to detect the current platform, we’ll be able to use the correct method of accessing the camera on each platform. That’s the only customization needed to make this program run on the Jetson Nano instead of a normal computer!
+Whenever our program detects a new face, we’ll call a function to add it to our known face database:
+def register_new_face(face_encoding, face_image):
+    known_face_encodings.append(face_encoding)
+    known_face_metadata.append({
+        "first_seen": datetime.now(),
+        "first_seen_this_interaction": datetime.now(),
+        "last_seen": datetime.now(),
+        "seen_count": 1,
+        "seen_frames": 1,
+        "face_image": face_image,
+    })
+First, we are storing the face encoding that represents the face in a list. Then, we are storing a matching dictionary of data about the face in a second list. We’ll use this to track the time we first saw the person, how long they’ve been hanging around the camera recently, how many times they have visited our house, and a small image of their face.
+We also need a helper function to check if an unknown face is already in our face database or not:
+def lookup_known_face(face_encoding):
+    metadata = None
+
+    if len(known_face_encodings) == 0:
+        return metadata
+
+    face_distances = face_recognition.face_distance(
+        known_face_encodings, 
+        face_encoding
+    )
+
+    best_match_index = np.argmin(face_distances)
+
+    if face_distances[best_match_index] < 0.65:
+        metadata = known_face_metadata[best_match_index]
+        metadata["last_seen"] = datetime.now()
+        metadata["seen_frames"] += 1
+
+        if datetime.now() - metadata["first_seen_this_interaction"]  
+                > timedelta(minutes=5):
+            metadata["first_seen_this_interaction"] = datetime.now()
+            metadata["seen_count"] += 1
+
+    return metadata
+We are doing a few important things here:
+Using the face_recogntion library, we check how similar the unknown face is to all previous visitors. The face_distance() function gives us a numerical measurement of similarity between the unknown face and all known faces— the smaller the number, the more similar the faces.
+If the face is very similar to one of our known visitors, we assume they are a repeat visitor. In that case, we update their “last seen” time and increment the number of times we have seen them in a frame of video.
+Finally, if this person has been seen in front of the camera in the last five minutes, we assume they are still here as part of the same visit. Otherwise, we assume that this is a new visit to our house, so we’ll reset the time stamp tracking their most recent visit.
+The rest of the program is the main loop — an endless loop where we fetch a frame of video, look for faces in the image, and process each face we see. It is the main heart of the program. Let’s check it out:
+def main_loop():
+    if running_on_jetson_nano():
+        video_capture = 
+            cv2.VideoCapture(
+                get_jetson_gstreamer_source(), 
+                cv2.CAP_GSTREAMER
+            )
+    else:
+        video_capture = cv2.VideoCapture(0)
+The first step is to get access to the camera using whichever method is appropriate for our computer hardware. But whether we are running on a normal computer or a Jetson Nano, the video_capture object will let us grab frames of video from our computer’s camera.
+So let’s start grabbing frames of video:
+while True:
+    # Grab a single frame of video
+    ret, frame = video_capture.read()
+
+    # Resize frame of video to 1/4 size
+    small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
+
+    # Convert the image from BGR color
+    rgb_small_frame = small_frame[:, :, ::-1]
+Each time we grab a frame of video, we’ll also shrink it to 1/4 size. This will make the face recognition process run faster at the expense of only detecting larger faces in the image. But since we are building a doorbell camera that only recognizes people near the camera, that shouldn’t be a problem.
+We also have to deal with the fact that OpenCV pulls images from the camera with each pixel stored as a Blue-Green-Red value instead of the standard order of Red-Green-Blue. Before we can run face recognition on the image, we need to convert the image format.
+Now we can detect all the faces in the image and convert each face into a face encoding. That only takes two lines of code:
+face_locations = face_recognition.face_locations(rgb_small_frame)
+face_encodings = face_recognition.face_encodings(
+                     rgb_small_frame, 
+                     face_locations
+                  )
+Next, we’ll loop through each detected face and decide if it is someone we have seen in the past or a brand new visitor:
+for face_location, face_encoding in zip(
+                       face_locations, 
+                       face_encodings):
+    metadata = lookup_known_face(face_encoding)
+
+    if metadata is not None:
+        time_at_door = datetime.now() - 
+            metadata['first_seen_this_interaction']
+        face_label = f"At door {int(time_at_door.total_seconds())}s"
+
+    else:
+        face_label = "New visitor!"
+
+        # Grab the image of the the face
+        top, right, bottom, left = face_location
+        face_image = small_frame[top:bottom, left:right]
+        face_image = cv2.resize(face_image, (150, 150))
+
+        # Add the new face to our known face data
+        register_new_face(face_encoding, face_image)
+If we have seen the person before, we’ll retrieve the metadata we’ve stored about their previous visits. If not, we’ll add them to our face database and grab the picture of their face from the video image to add to our database.
+Now that we have found all the people and figured out their identities, we can loop over the detected faces again just to draw boxes around each face and add a label to each face:
+for (top, right, bottom, left), face_label in 
+                  zip(face_locations, face_labels):
+    # Scale back up face location
+    # since the frame we detected in was 1/4 size
+    top *= 4
+    right *= 4
+    bottom *= 4
+    left *= 4
+
+    # Draw a box around the face
+    cv2.rectangle(
+        frame, (left, top), (right, bottom), (0, 0, 255), 2
+    )
+
+    # Draw a label with a description below the face
+    cv2.rectangle(
+        frame, (left, bottom - 35), (right, bottom), 
+        (0, 0, 255), cv2.FILLED
+    )
+    cv2.putText(
+        frame, face_label, 
+        (left + 6, bottom - 6), 
+        cv2.FONT_HERSHEY_DUPLEX, 0.8, 
+        (255, 255, 255), 1
+    )
+    
+To draw that, we need to loop over all known faces and see which ones have been in front of the camera recently. For each recent visitor, we’ll draw their face image on the screen and draw a visit count:
+number_of_recent_visitors = 0
+for metadata in known_face_metadata:
+    # If we have seen this person in the last minute
+    if datetime.now() - metadata["last_seen"] 
+                         < timedelta(seconds=10):
+        # Draw the known face image
+        x_position = number_of_recent_visitors * 150
+        frame[30:180, x_position:x_position + 150] =
+              metadata["face_image"]
+        number_of_recent_visitors += 1
+
+        # Label the image with how many times they have visited
+        visits = metadata['seen_count']
+        visit_label = f"{visits} visits"
+        if visits == 1:
+            visit_label = "First visit"
+        cv2.putText(
+            frame, visit_label, 
+            (x_position + 10, 170), 
+            cv2.FONT_HERSHEY_DUPLEX, 0.6, 
+            (255, 255, 255), 1
+        )
+Finally, we can display the current frame of video on the screen with all of our annotations drawn on top of it:
+cv2.imshow('Video', frame)
+And to make sure we don’t lose data if the program crashes, we’ll save our list of known faces to disk every 100 frames:
+if len(face_locations) > 0 and number_of_frames_since_save > 100:
+    save_known_faces()
+    number_of_faces_since_save = 0
+else:
+    number_of_faces_since_save += 1
+And that’s it aside from a line or two of clean up code to turn off the camera when the program exits.
+The start-up code for the program is at the very bottom of the program:
+if __name__ == "__main__":
+    load_known_faces()
+    main_loop()
+All we are doing is loading the known faces (if any) and then starting the main loop that reads from the camera forever and displays the results on the screen.
+The whole program is only about 200 lines, but it does something pretty interesting — it detects visitors, identifies them and tracks every single time they have come back to your door. It’s a fun demo, but it could also be really creepy if you abuse it.    
